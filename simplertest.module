@@ -1,0 +1,263 @@
+<?php
+
+/**
+ * Implementation of hook_menu.
+ *
+ * Adds the necessary page callbacks to run single test cases from the simpletest
+ * page.
+ */
+function simplertest_menu() {
+  return array(
+    'admin/config/development/testing/class/%' => array(
+      'title' => '',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('simplertest_method_form', 5),
+      'access arguments' => array('administer unit tests'),
+    )
+  );
+}
+
+/**
+ * Callback function for drupal_get_form.
+ *
+ * @param  array $form
+ *    The form being built.
+ * @param  string $class_name
+ *    The test class name.
+ * @return array
+ *    A Drupal form array.
+ */
+function simplertest_method_form($form, $form_state, $class_name) {
+  $methods = simplertest_get_test_cases($class_name);
+  $form['tests'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Tests'),
+    '#description' => t('Select the test(s) you would like to run, and click <em>Run tests</em>.'),
+  );
+  $form['tests']['table'] = array(
+    '#theme' => 'simpletest_test_table'
+  );
+  $form['tests']['table'][$class_name] = array(
+    '#collapsed' => TRUE,
+  );
+  foreach ($methods as $method_name) {
+    $form['tests']['table'][$class_name][$method_name] = array(
+      '#type' => 'checkbox',
+      '#title' => $method_name,
+      '#description' => simplertest_get_test_case_info($class_name, $method_name),
+    );
+  }
+  // Operation buttons.
+  $form['tests']['op'] = array(
+    '#type' => 'submit',
+    '#value' => t('Run tests'),
+  );
+  return $form;
+}
+
+/**
+ * Submit function for the simplertest_method_form.
+ *
+ * Prepares Drupal to run the tests.
+ *
+ * @see simpletest_test_form_submit().
+ */
+function simplertest_method_form_submit($form, &$form_state) {
+  simpletest_classloader_register();
+  // Get list of tests.
+  $tests_list = array();
+  $class_name = $form_state['build_info']['args'][0];
+  // Double check the class and method exists.
+  foreach ($form_state['values'] as $method_name => $value) {
+    if ($value === 1 && method_exists($class_name, $method_name)) {
+      $tests_list[$class_name][] = $method_name;
+    }
+  }
+  if (count($tests_list) > 0 ) {
+    // Add the class itself to the first position of the array, because simpletest will expect a class there and would
+    // throw errors otherwise.
+    array_unshift($tests_list, $class_name);
+    // Flag that this test run is a simplertest one and not a standard one.
+    simplertest_set_method_test(true);
+    $test_id = simpletest_run_tests($tests_list, 'drupal');
+    // TODO maybe change this to a custom page or alter the report form so that
+    // single test cases can be executed from the test run report.
+    $form_state['redirect'] = 'admin/config/development/testing/results/' . $test_id;
+  }
+  else {
+    drupal_set_message(t('No test(s) selected.'), 'error');
+  }
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter.
+ *
+ * Alters the simpletest form to include links to run single methods of a test case.
+ */
+function simplertest_form_simpletest_test_form_alter(&$form, &$form_state) {
+  foreach($form['tests']['table'] as $group_name => $group) {
+    if (!is_array($group)) { continue; }
+    foreach($group as $class_name => $description) {
+      if (is_array($form['tests']['table'][$group_name][$class_name])) {
+        $form['tests']['table'][$group_name][$class_name]['#description'] .= ' '
+            . l('Run single test case »', "admin/config/development/testing/class/$class_name");
+      }
+    }
+  }
+}
+
+/**
+ * Get all the test cases of a given class.
+ *
+ * Given a test case class, returns all public methods whose name begins with "test".
+ *
+ * @param string $class_name
+ *    The class name to return methods for.
+ * @return array
+ *    An array of test method names.
+ */
+function simplertest_get_test_cases($class_name) {
+    return array_filter(get_class_methods($class_name) ? : array(),
+        function($method_name) {
+            return substr($method_name, 0, 4) == 'test';
+        });
+}
+
+/**
+ * Given a class name and method name, uses reflection to get the method's
+ * docblock and uses it as the test description.
+ *
+ * @param string $class_name
+ *    The test class name.
+ * @param string $method_name
+ *    The test method name.
+ * @return string
+ *    A cleaned-up version of the test method's docblock.
+ */
+function simplertest_get_test_case_info($class_name, $method_name) {
+  $rc = new ReflectionClass($class_name);
+  $description = $rc->getMethod($method_name)->getDocComment() ? : 'No description available.';
+  $description_multiline = explode("\n", $description);
+  foreach ($description_multiline as $line => &$description_line) {
+    // Remove docblock comment delimiters
+    $description_line = preg_replace('#\s*/?\*/? ?#i', '', $description_line);
+    // Ignore @keyword lines.
+    if (empty($description_line) || preg_match('#^@[a-z0-9_]+#i', $description_line)) {
+      unset($description_multiline[$line]);
+    }
+  }
+  return implode(' ', $description_multiline);
+}
+
+/**
+ * Implementation of hook_batch_alter.
+ *
+ * Used to alter the batch before it is executed to make sure our custom test
+ * function is used.
+ */
+function simplertest_batch_alter(&$batch) {
+  if (!simplertest_is_method_test()) {
+    return;
+  }
+  // A simplertest is about to run. We should alter the batch to ensure our functions get called instead of the
+  // default simpletest ones.
+  $found = false;
+  // Search for the batch set to alter, in case there are more than one.
+  foreach ($batch['sets'] as $set_id => $batch_set) {
+    if ($batch_set['operations'][0][0] == '_simpletest_batch_operation')  {
+      $found = true;
+      break;
+    }
+  }
+  if ($found) {
+    $batch['sets'][$set_id]['operations'][0][0] = '_simplertest_batch_operation';
+    // Remove the className we added for compatibility with simpletest.
+    $class_name = array_shift($batch['sets'][$set_id]['operations'][0][1][0]);
+    $instance = new $class_name();
+    $info = $instance->getInfo();
+    $batch['sets'][$set_id]['init_message'] = t('Processing test @num of @max - %test.', array('%test' => $info['name'], '@num' => '1', '@max' => count($batch['sets'][$set_id]['operations'][0][1][0])));
+  }
+}
+
+/**
+ * Sets the simplertest flag.
+ *
+ * @param boolean $param
+ *    Sets the simplertest flag, meaning that the test about to be executed
+ *    contains only some test cases (methods) to run.
+ */
+function simplertest_set_method_test($param) {
+
+  $method_test = &drupal_static('simplertest_is_method_test', false);
+  $method_test = (bool)$param;
+}
+
+/**
+ * Returns the current state of the simplertest flag.
+ *
+ * @return boolean
+ *    The current state of the simplertest flag.
+ */
+function simplertest_is_method_test() {
+
+  return drupal_static(__FUNCTION__, false);
+}
+
+// The code below is copied from the simpletest module and slightly altered.
+
+/**
+ * Batch operation callback.
+ *
+ * @see _simpletest_batch_operation.
+ */
+function _simplertest_batch_operation($test_list_init, $test_id, &$context) {
+  simpletest_classloader_register();
+  // Get working values.
+  if (!isset($context['sandbox']['max'])) {
+    // First iteration: initialize working values.
+    $test_list = $test_list_init;
+    $context['sandbox']['max'] = count($test_list);
+    $test_results = array('#pass' => 0, '#fail' => 0, '#exception' => 0, '#debug' => 0);
+  }
+  else {
+    // Nth iteration: get the current values where we last stored them.
+    $test_list = $context['sandbox']['tests'];
+    $test_results = $context['sandbox']['test_results'];
+  }
+  $max = $context['sandbox']['max'];
+
+  // The array key contains the test class, the values are the methods to run.
+  reset($test_list);
+  $test_class = key($test_list);
+  $test_methods = array_shift($test_list);
+  $test = new $test_class($test_id);
+  // DrupalUnitTestCase supports passing an array of methods to run.
+  $test->run($test_methods);
+  $size = count($test_list);
+  $info = $test->getInfo();
+
+  module_invoke_all('test_finished', $test->results);
+
+  // Gather results and compose the report.
+  $test_results[$test_class] = $test->results;
+  foreach ($test_results[$test_class] as $key => $value) {
+    $test_results[$key] += $value;
+  }
+  $test_results[$test_class]['#name'] = $info['name'];
+  $items = array();
+  foreach (element_children($test_results) as $class) {
+    array_unshift($items, '<div class="simpletest-' . ($test_results[$class]['#fail'] + $test_results[$class]['#exception'] ? 'fail' : 'pass') . '">' . t('@name: @summary', array('@name' => $test_results[$class]['#name'], '@summary' => _simpletest_format_summary_line($test_results[$class]))) . '</div>');
+  }
+  $context['message'] = t('Processed test @num of @max - %test.', array('%test' => $info['name'], '@num' => $max - $size, '@max' => $max));
+  $context['message'] .= '<div class="simpletest-' . ($test_results['#fail'] + $test_results['#exception'] ? 'fail' : 'pass') . '">Overall results: ' . _simpletest_format_summary_line($test_results) . '</div>';
+  $context['message'] .= theme('item_list', array('items' => $items));
+
+  // Save working values for the next iteration.
+  $context['sandbox']['tests'] = $test_list;
+  $context['sandbox']['test_results'] = $test_results;
+  // The test_id is the only thing we need to save for the report page.
+  $context['results']['test_id'] = $test_id;
+
+  // Multistep processing: report progress.
+  $context['finished'] = 1 - $size / $max;
+}

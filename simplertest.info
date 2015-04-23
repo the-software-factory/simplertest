@@ -1,0 +1,6 @@
+name = Simpler Simpletest
+description = Extends the simpletest framework to allow running single test cases from the admin panel.
+package = Development
+dependencies[] = simpletest
+version = 1
+core = 7.x
